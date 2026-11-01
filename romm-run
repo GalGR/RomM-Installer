@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# romm-run - starts one RomM component in the foreground.
+# Every systemd user unit calls this, and you can run it by hand for debugging:
+#   ~/opt/romm/bin/romm-run backend
+# Components: valkey backend worker scan-worker streaming-worker cron nginx watcher
+set -euo pipefail
+
+ROMM_HOME="${ROMM_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+ENV_FILE="${ROMM_HOME}/romm.env"
+[[ -f ${ENV_FILE} ]] || { echo "romm-run: ${ENV_FILE} not found" >&2; exit 1; }
+
+set -a
+# shellcheck disable=SC1090
+. "${ENV_FILE}"
+set +a
+
+APP="${ROMM_HOME}/app"
+BACKEND="${APP}/backend"
+VENV="${APP}/.venv"
+RUN_DIR="${ROMM_HOME}/run"
+mkdir -p "${RUN_DIR}"
+
+# tools/bin holds symlinks to node, 7zz, bsdtar, valkey-server, RAHasher...
+export PATH="${ROMM_HOME}/tools/bin:${VENV}/bin:/usr/local/bin:/usr/bin:/bin"
+# lib/ only holds libraries the system loader can't find on its own (e.g. brew's libmagic)
+if compgen -G "${ROMM_HOME}/lib/*" >/dev/null; then
+	export LD_LIBRARY_PATH="${ROMM_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+export PYTHONPATH="${BACKEND}"
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+# fewer glibc malloc arenas: noticeably lower RSS for the threaded Python processes
+export MALLOC_ARENA_MAX=2
+# Cap thread pools that otherwise size themselves by CPU count (128 on the
+# server, where every thread's reserved address space counts against a ~10 GB
+# per-process virtual memory limit): rom-converto (Rust), Node for RomPatcher.js
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-2}" TOKIO_WORKER_THREADS="${TOKIO_WORKER_THREADS:-2}"
+export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-2}" NODE_OPTIONS="${NODE_OPTIONS:---v8-pool-size=2}"
+
+# The password is hex, so it never needs URL-encoding. Passed via env, never argv,
+# so it doesn't show up in `ps` for other users on the box.
+export RQ_REDIS_URL="redis://:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB:-0}"
+
+wait_for_port() {
+	local host=$1 port=$2 name=$3 tries=120
+	until (echo >"/dev/tcp/${host}/${port}") 2>/dev/null; do
+		((tries--)) || { echo "romm-run: ${name} on ${host}:${port} never came up" >&2; exit 1; }
+		sleep 0.5
+	done
+}
+
+start_rq_worker() {
+	local worker_class=$1
+	shift
+	wait_for_port "${REDIS_HOST}" "${REDIS_PORT}" valkey
+	wait_for_port "${DB_HOST}" "${DB_PORT}" MariaDB
+	cd "${BACKEND}"
+	exec rq worker \
+		--path "${BACKEND}" \
+		--worker-class "handler.rq_worker.${worker_class}" \
+		--connection-class handler.redis_handler.RomMRedis \
+		--results-ttl "${TASK_RESULT_TTL:-86400}" \
+		--logging_level "${LOGLEVEL:-INFO}" \
+		--with-scheduler \
+		"$@"
+}
+
+case "${1:-}" in
+valkey)
+	exec valkey-server "${ROMM_HOME}/valkey/valkey.conf"
+	;;
+backend)
+	wait_for_port "${REDIS_HOST}" "${REDIS_PORT}" valkey
+	wait_for_port "${DB_HOST}" "${DB_PORT}" MariaDB
+	cd "${BACKEND}"
+	alembic upgrade head
+	python3 startup.py
+	log_conf="${RUN_DIR}/gunicorn-logging.conf"
+	cp "${APP}/docker/gunicorn/logging.conf" "${log_conf}"
+	sed -i '/\[logger_gunicorn\]/,/^\[/ s/^level=.*/level='"${LOGLEVEL^^}"'/' "${log_conf}"
+	exec gunicorn \
+		--bind="127.0.0.1:${DEV_PORT}" \
+		--pid="${RUN_DIR}/gunicorn.pid" \
+		--no-control-socket \
+		--forwarded-allow-ips="${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}" \
+		--worker-class uvicorn_worker.UvicornWorker \
+		--workers "${WEB_SERVER_CONCURRENCY:-1}" \
+		--timeout "${WEB_SERVER_TIMEOUT:-300}" \
+		--keep-alive "${WEB_SERVER_KEEPALIVE:-65}" \
+		--max-requests "${WEB_SERVER_MAX_REQUESTS:-1000}" \
+		--max-requests-jitter "${WEB_SERVER_MAX_REQUESTS_JITTER:-100}" \
+		--worker-connections "${WEB_SERVER_WORKER_CONNECTIONS:-1000}" \
+		--error-logfile - \
+		--log-config "${log_conf}" \
+		main:app
+	;;
+worker)
+	start_rq_worker RomMWorker high default low
+	;;
+scan-worker)
+	start_rq_worker RomMWorker scans
+	;;
+streaming-worker)
+	start_rq_worker PreloadingWorker streaming
+	;;
+cron)
+	wait_for_port "${REDIS_HOST}" "${REDIS_PORT}" valkey
+	wait_for_port "${DB_HOST}" "${DB_PORT}" MariaDB
+	cd "${BACKEND}"
+	exec rq cron \
+		--path "${BACKEND}" \
+		--connection-class handler.redis_handler.RomMRedis \
+		--logging-level "${LOGLEVEL:-INFO}" \
+		tasks.cron_config
+	;;
+nginx)
+	wait_for_port 127.0.0.1 "${DEV_PORT}" gunicorn
+	exec "${ROMM_HOME}/nginx/sbin/nginx" -p "${ROMM_HOME}/nginx" -c conf/nginx.conf -g 'daemon off;'
+	;;
+watcher)
+	cd "${BACKEND}"
+	exec watchfiles --target-type command "python3 watcher.py" "${ROMM_BASE_PATH}/library"
+	;;
+*)
+	echo "usage: $0 {valkey|backend|worker|scan-worker|streaming-worker|cron|nginx|watcher}" >&2
+	exit 2
+	;;
+esac
