@@ -90,7 +90,7 @@ Installer settings are given on the command line, e.g. `BUILD_RAHASHER=1 ./insta
 
 Stock EmulatorJS unpacks a zipped DOS game into browser memory and DOSBox Pure runs it from there, so whatever the game writes (saves, settings) is lost when the tab closes and never reaches RomM; only save states sync. With `PATCH_DOS_SAVES=1` (default) the installer patches EmulatorJS so every file the game creates or changes is packed into one zip, `<game>.pure.zip`, which RomM syncs like any save (the **Saves** tab, loading it in another browser). The same copy is also kept in the browser.
 
-- RomM checks for changes every second and uploads after two identical checks ("Save synced"), so wait for that before quitting right after an in-game save.
+- Changes are held back before they sync: 5 seconds after the game first writes, and if it keeps writing the wait doubles each time (10, 20, 40 s) up to one sync per 60 seconds; a quiet spell resets it to 5 s. Quit, Save & Quit and closing the tab always sync the latest files right away. The limits are `SYNC_MIN_MS` / `SYNC_MAX_MS` at the top of the helper in `dossaves.py`.
 - The server copy is named `<game>.srm` (RomM's naming), but it's a zip of the game's changed files. It also works as a DOSBox Pure `.pure.zip` outside RomM.
 - A save holds changed and new files only; a file the game deletes comes back when the save is loaded.
 - **Save & Quit** still quits (and keeps the save file) when the game has exited to DOS, where DOSBox Pure can't make a state.

@@ -54,6 +54,13 @@ HELPER = r"""/*romm-dos-saves*/(function () {
     if (typeof window === "undefined" || window.EJS_RommDos) return;
 
     const SAVE_DIR = "/data/saves/DOSBox-pure";
+    // Sync window: changes are held this long after the first one before RomM sees
+    // them. A change within one window of the last sync doubles it (up to the cap),
+    // so a game that writes all the time syncs at most once per SYNC_MAX_MS; a
+    // quiet spell of one window drops it back to SYNC_MIN_MS. A forced read
+    // (getSaveFile() without false: Quit, Save & Quit, closing the tab) skips it.
+    const SYNC_MIN_MS = 5000;
+    const SYNC_MAX_MS = 60000;
     // Top-level names EmulatorJS/RetroArch use when the game folder is "/" itself
     const ROOT_SKIP = /^(dev|proc|tmp|home|data|shader|PPSSPP|game\.state|\d+-quick\.state)$/;
 
@@ -242,9 +249,31 @@ HELPER = r"""/*romm-dos-saves*/(function () {
         return out;
     }
 
+    // path -> {mtime, size} for every file in the game tree. Reads the in-memory
+    // filesystem's nodes directly (about 20x faster than readdir+stat, so the
+    // once-a-second check stays well under a millisecond for thousands of files),
+    // falling back to stat() where a node doesn't carry the fields.
     function walk(st) {
         const files = new Map(), FS = st.FS;
-        const visit = (dir) => {
+        const statFile = (p) => {
+            try { const s = FS.stat(p); files.set(p, { mtime: +s.mtime, size: s.size }); } catch (e) { /* vanished */ }
+        };
+        const visitNodes = (node, dir) => {
+            for (const name in node.contents) {
+                if (dir === "/" && ROOT_SKIP.test(name)) continue;
+                const ch = node.contents[name], p = (dir === "/" ? "" : dir) + "/" + name;
+                if (!ch || ch.mounted) continue;
+                if (FS.isDir(ch.mode)) {
+                    if (ch.contents && typeof ch.contents === "object") visitNodes(ch, p);
+                    else visitPaths(p);
+                } else if (FS.isFile(ch.mode)) {
+                    const m = ch.mtime !== undefined ? ch.mtime : ch.timestamp;
+                    if (m !== undefined && typeof ch.usedBytes === "number") files.set(p, { mtime: +m, size: ch.usedBytes });
+                    else statFile(p);
+                }
+            }
+        };
+        const visitPaths = (dir) => {
             let names;
             try { names = FS.readdir(dir); } catch (e) { return; }
             for (const n of names) {
@@ -253,11 +282,14 @@ HELPER = r"""/*romm-dos-saves*/(function () {
                 const p = (dir === "/" ? "" : dir) + "/" + n;
                 let s;
                 try { s = FS.stat(p); } catch (e) { continue; }
-                if (FS.isDir(s.mode)) visit(p);
+                if (FS.isDir(s.mode)) visitPaths(p);
                 else if (FS.isFile(s.mode)) files.set(p, { mtime: +s.mtime, size: s.size });
             }
         };
-        visit(st.root);
+        let root = null;
+        try { root = FS.lookupPath(st.root).node; } catch (e) { /* use paths */ }
+        if (root && root.contents && typeof root.contents === "object") visitNodes(root, st.root);
+        else visitPaths(st.root);
         return files;
     }
     function mkdirs(FS, dir) {
@@ -269,16 +301,20 @@ HELPER = r"""/*romm-dos-saves*/(function () {
         }
     }
 
-    function refresh(st) {
-        const now = walk(st), changed = [];
-        for (const [p, s] of now) {
+    // Files created or changed since boot (only stat calls: cheap enough per tick)
+    function scan(st) {
+        const changed = [];
+        for (const [p, s] of walk(st)) {
             const b = st.baseline.get(p);
             if (!b || b.mtime !== s.mtime || b.size !== s.size) changed.push([p, s.mtime, s.size]);
         }
         changed.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-        const key = JSON.stringify(changed);
-        if (key === st.key) return;
-        st.key = key;
+        return { changed, key: JSON.stringify(changed) };
+    }
+
+    // Writes the save file RomM reads (and this browser keeps) from the current files
+    function publish(st, changed, key, why) {
+        st.pubKey = key;
         if (!changed.length) {
             if (st.FS.analyzePath(st.path).exists) st.FS.unlink(st.path);
             return;
@@ -286,6 +322,30 @@ HELPER = r"""/*romm-dos-saves*/(function () {
         const prefix = st.root === "/" ? "/" : st.root + "/";
         const zip = makeZip(changed.map(([p, mtime]) => ({ name: p.slice(prefix.length), data: st.FS.readFile(p), mtime })));
         st.FS.writeFile(st.path, zip);
+        console.log("[RomM DOS saves] save file updated (" + why + "): " + changed.length + " file(s), " + zip.length + " bytes");
+    }
+
+    function refresh(st, force) {
+        const now = Date.now(), { changed, key } = scan(st);
+        if (key === st.pubKey) { st.pendingSince = null; return; }
+        if (force) {
+            publish(st, changed, key, "forced");
+            st.pendingSince = null;
+            st.lastSync = now;
+            return;
+        }
+        if (st.pendingSince === null) {
+            // First change since the last sync: still writing -> longer window
+            st.window = st.lastSync !== null && now - st.lastSync < st.window
+                ? Math.min(st.window * 2, st.maxWindow)
+                : st.minWindow;
+            st.pendingSince = now;
+        }
+        if (now - st.pendingSince >= st.window) {
+            publish(st, changed, key, "after " + st.window / 1000 + " s");
+            st.pendingSince = null;
+            st.lastSync = now;
+        }
     }
 
     function apply(st) {
@@ -302,7 +362,9 @@ HELPER = r"""/*romm-dos-saves*/(function () {
             FS.writeFile(target, e.data);
             try { FS.utime(target, e.mtime, e.mtime); } catch (err) { /* keeps the write time */ }
         }
-        st.key = null;
+        // The save file already holds exactly these files: nothing to sync
+        st.pubKey = scan(st).key;
+        st.pendingSince = null;
         console.log("[RomM DOS saves] loaded " + entries.length + " file(s) from " + st.path);
     }
 
@@ -315,9 +377,16 @@ HELPER = r"""/*romm-dos-saves*/(function () {
             try { base = decodeURIComponent(base); } catch (e) { /* keep as is */ }
             base = base.replace(/[\/\\]/g, "_").replace(/\.(zip|7z|rar|dosz|dosc)$/i, "") || "game";
             mkdirs(FS, SAVE_DIR);
-            const st = { FS, root, path: SAVE_DIR + "/" + base + ".pure.zip", key: null, baseline: null };
+            const timing = window.EJS_RommDosTiming || {};
+            const st = {
+                FS, root, path: SAVE_DIR + "/" + base + ".pure.zip", baseline: null, pubKey: "[]",
+                minWindow: timing.min || SYNC_MIN_MS, maxWindow: timing.max || SYNC_MAX_MS,
+                pendingSince: null, lastSync: null, window: 0,
+            };
+            st.window = st.minWindow;
             st.baseline = walk(st);
-            emu.rommDos = { path: st.path, root, refresh: () => refresh(st), apply: () => apply(st) };
+            if (FS.analyzePath(st.path).exists) st.pubKey = null; // a stale copy: apply() settles it
+            emu.rommDos = { path: st.path, root, refresh: (force) => refresh(st, force), apply: () => apply(st) };
             apply(st); // this browser's last copy, if any; RomM may load the server's after start
             console.log("[RomM DOS saves] game folder " + root + ", save file " + st.path);
         },
@@ -347,7 +416,7 @@ EJS_PATCHES = {
         (
             "    getSaveFile(save) {\n        if (save !== false) {\n            this.saveSaveFiles();\n        }\n",
             "    getSaveFile(save) {\n        if (save !== false) {\n            this.saveSaveFiles();\n        }\n"
-            "        if (this.EJS.rommDos) this.EJS.rommDos.refresh();\n",
+            "        if (this.EJS.rommDos) this.EJS.rommDos.refresh(save !== false);\n",
         ),
         (
             "    loadSaveFiles() {\n        this.clearEJSResetTimer();\n",
@@ -363,7 +432,7 @@ EJS_PATCHES["emulator.min.js"] += [
     ),
     (
         "getSaveFile(t){!1!==t&&this.saveSaveFiles();return",
-        "getSaveFile(t){!1!==t&&this.saveSaveFiles();this.EJS.rommDos&&this.EJS.rommDos.refresh();return",
+        "getSaveFile(t){!1!==t&&this.saveSaveFiles();this.EJS.rommDos&&this.EJS.rommDos.refresh(!1!==t);return",
     ),
     (
         "loadSaveFiles(){this.clearEJSResetTimer(),this.functions.loadSaveFiles()}",
