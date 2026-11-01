@@ -14,6 +14,7 @@ Keep them together in one folder (e.g. `~/romm-installer/`):
 | `install-with-dbadmin.sh` | Runs `install.sh` with your MariaDB admin login, kept in a private `.romm-dbadmin.env` next to it. Use this instead of calling `install.sh` directly. |
 | `romm-run` | Starts one RomM component; the systemd units call it. |
 | `subpath.py` | Makes RomM's web interface work under `/romm`. Used by `install.sh`. |
+| `dossaves.py` | Makes in-game saves of DOS games (EmulatorJS's DOSBox Pure core) reach RomM. Used by `install.sh`. |
 | `dbcheck.py` | Diagnostic: which MariaDB a `host:port` reaches, and from which address it sees you. |
 | `threadprobe.py` | Diagnostic: what limits thread creation on the server. |
 | `HANDOFF.md` | Complete technical documentation. |
@@ -78,11 +79,21 @@ A re-run keeps `romm.env`, the database, your covers/saves/states, and any optio
 |---|---|---|
 | `INSTALL_EMULATORS` (installer) | `1` | In-browser play: EmulatorJS, Ruffle, js-dos, FAKE-08 (about 340 MB of disk together) and EasyRPG (size not measured). |
 | `INSTALL_ROM_CONVERTO` (installer) | `1` | Downloads the converter binary; does nothing unless `ROM_CONVERTO_ENABLED=true`. |
+| `PATCH_DOS_SAVES` (installer) | `1` | Lets in-game saves of DOS games sync with RomM, see "DOS games" below. `0` installs EmulatorJS and the player unchanged. |
 | `BUILD_RAHASHER` (installer) | `0` | Builds RAHasher (needs `g++`). Only needed for RetroAchievements, see below. Built once. |
 | `ROM_CONVERTO_ENABLED` (`romm.env`) | `false` | Format conversion (CHD, CSO, RVZ, 3DS). Its "Convert library" task converts files **in place inside `~/games`**, and compression is CPU/RAM heavy. |
 | `ENABLE_RESCAN_ON_FILESYSTEM_CHANGE` (`romm.env`) | `false` | Also needs `systemctl --user enable --now romm-watcher`. Downloads written straight into `~/games` can trigger scans of unfinished files. `ENABLE_SCHEDULED_RESCAN=true` (nightly at 03:00 by default) is a lighter alternative. |
 
 Installer settings are given on the command line, e.g. `BUILD_RAHASHER=1 ./install-with-dbadmin.sh`.
+
+## DOS games (EmulatorJS / DOSBox Pure)
+
+Stock EmulatorJS unpacks a zipped DOS game into browser memory, so whatever the game writes (saves, settings) is lost when the tab closes and never reaches RomM; only save states sync. With `PATCH_DOS_SAVES=1` (default) the installer patches EmulatorJS so DOSBox Pure gets the zip itself and keeps everything the game writes in its own `<game>.pure.zip`, which RomM then syncs like any save (the **Saves** tab, cross-browser loading included).
+
+- DOSBox Pure writes that file about a second after the game closes its save; RomM uploads it about two seconds later ("Save synced"). Quitting right after an in-game save can miss it.
+- The server copy is named `<game>.srm`, but it's DOSBox Pure's zip. For DOSBox Pure outside RomM, rename it to `<game>.pure.zip`.
+- **Save & Quit** still quits (and keeps the save file) when the game has exited to DOS, where DOSBox Pure can't make a state.
+- Only zip/dosz games. 7z/RAR archives and booted disk images (installed Windows/DOS) behave as before.
 
 ## Metadata providers
 

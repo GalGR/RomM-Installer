@@ -9,6 +9,7 @@ Files in this bundle (keep them together in one folder, e.g. `~/romm-installer/`
 | `install.sh` | Installs, repairs and upgrades everything. Idempotent. The single source of truth for the setup. |
 | `romm-run` | Launcher for every runtime component; every systemd unit calls it. Copied to `~/opt/romm/bin/romm-run` by the installer. |
 | `subpath.py` | Makes RomM's frontend work under a URL prefix (`/romm`). Called by `install.sh`. |
+| `dossaves.py` | Makes DOSBox Pure's in-game saves sync with RomM: patches EmulatorJS (`ejs` mode) and RomM's player (`src` mode). Called by `install.sh` unless `PATCH_DOS_SAVES=0`. See 9.9. |
 | `install-with-dbadmin.sh` | Wrapper: runs `install.sh` (passing all arguments and environment) with `DB_ADMIN_USER`/`DB_ADMIN_PASSWD` taken from the environment (then saved) or from `.romm-dbadmin.env` next to it; prompts to create that file if missing/empty/incomplete; refuses a file that is a symlink, not owned by the user, or readable/writable by group/others. The file is parsed, never executed, and written mode 600 with single-quoted values (also loadable with `set -a; . file`). The credentials are deliberately never stored in `romm.env`, which every RomM service loads. |
 | `dbcheck.py` | Diagnostic: shows which MariaDB instance a `host:port` reaches and how it sees the client. |
 | `threadprobe.py` | Diagnostic: finds what limits thread creation (count cap vs memory cap). |
@@ -151,6 +152,7 @@ BUILD_RAHASHER=1 ./install.sh
 | `INSTALL_EMULATORS` | `1` | EmulatorJS (~297 MB), Ruffle (~27 MB), js-dos (~18 MB), FAKE-08 (<1 MB), EasyRPG. Needed for in-browser play. |
 | `INSTALL_ROM_CONVERTO` | `1` | 30 MB static binary; inert unless `ROM_CONVERTO_ENABLED=true`. |
 | `BUILD_RAHASHER` | `0` | Needed only for automatic RetroAchievements matching (see 11). |
+| `PATCH_DOS_SAVES` | `1` | Apply `dossaves.py` (9.9). A missing anchor aborts the install naming the file; `0` skips both patches. |
 | `USE_BREW` | `auto` | Install missing deps with brew if present. |
 | `SETUP_SYSTEMD` | `auto` | Write units; start them if the user manager is reachable. |
 | `NODE_MAJOR` | `24` | RomM's frontend `package.json` engines require `node: 24`, `npm: >=11.10` with engine-strict. |
@@ -368,6 +370,24 @@ Originally the internal nginx prefixed `"/api/` and `"/assets/` in API JSON for 
 
 ---
 
+### 9.9 DOS games: in-game saves never reached RomM; Save & Quit did nothing after quitting to DOS (fixed 2026-11-01)
+Symptoms: save states synced, but the files a DOS game writes itself never appeared under Saves (SNES saves worked). Save & Quit after quitting the game to DOS neither saved nor quit.
+
+Causes (EmulatorJS 4.2.3, its `dosbox_pure` core 2.0.2, RomM 5.4.1), verified in source and reproduced in Chromium (cross-origin isolated, threaded core):
+- RomM syncs saves via `gameManager.getSaveFile()`, which reads RetroArch's `/data/saves/<core dir>/<content>.srm`. DOSBox Pure has no libretro SaveRAM (`retro_get_memory_size` returns 0), so that file never exists and `getSaveFile()` is always null.
+- EmulatorJS's `downloadRom` unpacks every zip into MEMFS `/` and starts the first file (DOSBox Pure's only listed extension is `conf`). DOSBox Pure then mounts `/` as a plain local drive, so the game's writes go straight into MEMFS (`/SAVE.DAT`), are never persisted (not even in the browser) and are lost with the tab. DOSBox Pure's own save mechanism (`<save dir>/<content>.pure.zip`, written about 1 s + 1 s/MB after a file is closed) only applies when it mounts a zip/dosz itself.
+- `getState()` throws when DOSBox Pure refuses a state because no game program runs (`ERR_GAMENOTRUNNING`, after quitting to DOS or its menu); RomM's Save & Quit handler has no try/catch, so it stopped before `immediateExit()`.
+
+Fix, `dossaves.py` (exact-string, idempotent, applied to `emulator.min.js` and to `src/emulator.js` + `src/GameManager.js` for `EJS_DEBUG`):
+- `ejs`: for `dosbox_pure` and data starting `PK\x03\x04`, write the archive unextracted as `/<decoded URL basename, .zip appended unless zip/dosz/dosc>` and use it as the content; `getSaveFilePath()` returns the `.srm` path with `.pure.zip` for that case. Everything in RomM (upload tick, Sync save, Quit flush, Save & Quit, `loadEmulatorJSSave` + restart) then works unchanged. `/data/saves` is IDBFS, so the file also persists per browser.
+- `src`: Save & Quit treats a failed `getState()` as "no state": uploads the save file and quits.
+
+Verified (sandbox, Chromium 141 via Playwright, real `dosbox_pure-thread*-wasm.data` from the release): stock: `getSaveFile()` null, nothing under `/data/saves`, `/SAVE.DAT` in MEMFS. Patched (minified and debug files): `/data/saves/DOSBox-pure/<name>.pure.zip` appears and `getSaveFile()` returns it (names with spaces/parentheses match RetroArch's path); in a fresh browser context RomM's load sequence (write to `getSaveFilePath()`, `loadSaveFiles()`, `restart()`) makes the file visible to a DOS program; a game that exits to DOS: `getState()` throws, the save file is still readable; a state made before the patch loads after it. RomM 5.4.1 frontend with the `src` patch: `vite build` and `vue-tsc --build` pass. Not run: the real RomM page end to end.
+
+Limits: a write in the last ~1 s before a restart/quit can be missed (DOSBox Pure's delayed write; on a save load the old overlay can be written over the loaded file in that window). Only zip/dosz content; 7z/RAR and booted disk images (`.img`/`.vhd`, OS installs, which use other save files) keep the stock behaviour. Saves are stored on the server as `<rom>.srm` (RomM's naming) though they are `.pure.zip` files. Saves a game wrote before the patch only existed in tab memory and are gone; progress kept in states survives.
+
+Upgrades: if EmulatorJS's `downloadRom`/`getSaveFilePath` or RomM's Save & Quit code changes, `dossaves.py` aborts naming the file; check whether upstream fixed it (EmulatorJS main declares `dontExtractRom` in `loader.js` as of 2026-10 but nothing uses it) before porting the anchors.
+
 ## 10. Testing approach (how to verify changes before giving them to the user)
 
 The work was verified in an Ubuntu 24.04 sandbox (1 CPU, 3 GB) emulating the server:
@@ -420,6 +440,7 @@ The work was verified in an Ubuntu 24.04 sandbox (1 CPU, 3 GB) emulating the ser
 - EasyRPG download (unreachable from the sandbox; should work on the server).
 - Whether cgroup `MemoryMax`/`CPUQuota` are enforced for the user's units.
 - The precise trigger of 9.1 on the server.
+- 9.9 in the real RomM page (verified at the EmulatorJS level with RomM's exact calls, plus build/type check), and with real DOS games.
 
 ---
 

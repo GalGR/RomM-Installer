@@ -21,6 +21,7 @@ PORT_MAX="${PORT_MAX:-37749}"
 INSTALL_EMULATORS="${INSTALL_EMULATORS:-1}"
 INSTALL_ROM_CONVERTO="${INSTALL_ROM_CONVERTO:-1}"
 BUILD_RAHASHER="${BUILD_RAHASHER:-0}"
+PATCH_DOS_SAVES="${PATCH_DOS_SAVES:-1}"             # DOSBox Pure in-game saves sync with RomM (dossaves.py)
 USE_BREW="${USE_BREW:-auto}"
 SETUP_SYSTEMD="${SETUP_SYSTEMD:-auto}"
 NODE_MAJOR=24
@@ -319,6 +320,10 @@ log "installing RomPatcher.js"
 
 # --------------------------------------------------------------- frontend ---
 log "building frontend"
+if [[ ${PATCH_DOS_SAVES} == 1 ]]; then
+	"${PY}" "${SCRIPT_DIR}/dossaves.py" src "${APP}/frontend" ||
+		die "DOS saves patch failed for RomM ${ROMM_VERSION} (see above); PATCH_DOS_SAVES=0 skips it"
+fi
 build_args=()
 if [[ -n ${ROMM_URL_PREFIX} ]]; then
 	"${PY}" "${SCRIPT_DIR}/subpath.py" src "${APP}/frontend" "${ROMM_URL_PREFIX}"
@@ -355,6 +360,10 @@ if [[ ${INSTALL_EMULATORS} == 1 ]]; then
 	if fetch "https://github.com/EmulatorJS/EmulatorJS/releases/download/v${v}/${v}.7z" \
 		"$(darg EMULATORJS_SHA256)" "${DL}/emulatorjs-${v}.7z"; then
 		7zz x -y -mmt2 -bso0 -bsp0 "${DL}/emulatorjs-${v}.7z" -o"${A}/emulatorjs"
+		if [[ ${PATCH_DOS_SAVES} == 1 ]]; then
+			"${PY}" "${SCRIPT_DIR}/dossaves.py" ejs "${A}/emulatorjs/data" ||
+				die "DOS saves patch failed for EmulatorJS ${v} (see above); PATCH_DOS_SAVES=0 skips it"
+		fi
 	else warn "EmulatorJS skipped"; fi
 
 	v="$(darg RUFFLE_VERSION)"
