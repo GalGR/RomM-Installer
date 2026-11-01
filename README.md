@@ -88,12 +88,13 @@ Installer settings are given on the command line, e.g. `BUILD_RAHASHER=1 ./insta
 
 ## DOS games (EmulatorJS / DOSBox Pure)
 
-Stock EmulatorJS unpacks a zipped DOS game into browser memory, so whatever the game writes (saves, settings) is lost when the tab closes and never reaches RomM; only save states sync. With `PATCH_DOS_SAVES=1` (default) the installer patches EmulatorJS so DOSBox Pure gets the zip itself and keeps everything the game writes in its own `<game>.pure.zip`, which RomM then syncs like any save (the **Saves** tab, cross-browser loading included).
+Stock EmulatorJS unpacks a zipped DOS game into browser memory and DOSBox Pure runs it from there, so whatever the game writes (saves, settings) is lost when the tab closes and never reaches RomM; only save states sync. With `PATCH_DOS_SAVES=1` (default) the installer patches EmulatorJS so every file the game creates or changes is packed into one zip, `<game>.pure.zip`, which RomM syncs like any save (the **Saves** tab, loading it in another browser). The same copy is also kept in the browser.
 
-- DOSBox Pure writes that file about a second after the game closes its save; RomM uploads it about two seconds later ("Save synced"). Quitting right after an in-game save can miss it.
-- The server copy is named `<game>.srm`, but it's DOSBox Pure's zip. For DOSBox Pure outside RomM, rename it to `<game>.pure.zip`.
+- RomM checks for changes every second and uploads after two identical checks ("Save synced"), so wait for that before quitting right after an in-game save.
+- The server copy is named `<game>.srm` (RomM's naming), but it's a zip of the game's changed files. It also works as a DOSBox Pure `.pure.zip` outside RomM.
+- A save holds changed and new files only; a file the game deletes comes back when the save is loaded.
 - **Save & Quit** still quits (and keeps the save file) when the game has exited to DOS, where DOSBox Pure can't make a state.
-- Only zip/dosz games. 7z/RAR archives and booted disk images (installed Windows/DOS) behave as before.
+- Booted disk images (installed Windows/DOS) keep their changes elsewhere and aren't covered.
 
 ## Metadata providers
 
